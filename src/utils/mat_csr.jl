@@ -545,8 +545,9 @@ Add to `s` the entries of `P` in `lo:hi` that do not fill a whole block of `C`: 
 from `lo` up to the first block boundary, and as many from `hi` down to the last one. Return
 the whole blocks that remain, as a range of indices one level up the pyramid, and the new sum.
 
-Every remainder here is of a non-negative value, because Reactant lowers `mod` to a truncated
-remainder when it raises a kernel to StableHLO, which is wrong for negative operands.
+Every remainder here is of a non-negative value: once a kernel is raised to StableHLO, Reactant
+computes `mod` and `fld` of a negative value as if they truncated (see
+https://github.com/JuliaDecisionFocusedLearning/CoolPDLP.jl/issues/167).
 """
 @inline function peel_blocks(P, lo::Int, hi::Int, s, ::Val{C}) where {C}
     r = (lo - 1) % C
