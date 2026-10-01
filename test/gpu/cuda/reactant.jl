@@ -13,6 +13,10 @@ Reactant.set_default_backend("gpu")
 
 const MATRIX_TYPES = (GPUSparseMatrixCSR, GPUSparseMatrixELL, GPUSparseMatrixCOO)
 
+# Formats whose products survive `@compile raise = true`: COO's atomic update does not raise yet,
+# and CSR only does through `spmv_csr_blocks!`
+const RAISABLE_TYPES = (GPUSparseMatrixCSR, GPUSparseMatrixELL)
+
 @testset verbose = true "Compiled products" begin
     rng = Xoshiro(0)
     A_cpu = sprandn(rng, 24, 16, 0.3)
@@ -37,8 +41,7 @@ const MATRIX_TYPES = (GPUSparseMatrixCSR, GPUSparseMatrixELL, GPUSparseMatrixCOO
         end
     end
 
-    # COO's atomic update does not raise yet, and CSR only does through `spmv_csr_blocks!`
-    @testset "$M raised to StableHLO" for M in (GPUSparseMatrixCSR, GPUSparseMatrixELL)
+    @testset "$M raised to StableHLO" for M in RAISABLE_TYPES
         # a long row next to empty ones, so that a row climbs the pyramid of block sums
         A_skew = copy(A_cpu)
         A_skew[3, :] = randn(rng, 16)
@@ -104,7 +107,7 @@ end
             @test Array(state_r.sol.x) ≈ Array(state.sol.x) rtol = 1.0e-6
             @test Array(state_r.sol.y) ≈ Array(state.sol.y) rtol = 1.0e-6
 
-            if M != GPUSparseMatrixCOO  # its atomic update does not raise yet
+            if M in RAISABLE_TYPES
                 state_r, milp_r, algo_r = traced_problem(milp0, sol0, algo)
                 raised_solve! = @compile raise = true CoolPDLP.solve!(state_r, milp_r, algo_r)
                 raised_solve!(state_r, milp_r, algo_r)

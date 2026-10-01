@@ -23,7 +23,10 @@ using SparseArrays: SparseArrays, SparseMatrixCSC, AbstractSparseMatrix, findnz,
 
 include("public.jl")
 
-@stable begin
+# On Julia 1.10, the type-stability checks of `@stable` survive in the GPU kernels as traps,
+# which Reactant cannot raise to StableHLO, so they are off there unless a preference says
+# otherwise. Later versions fold them away.
+@stable default_mode = (VERSION >= v"1.11" ? "error" : "disable") begin
     include("utils/device.jl")
     include("utils/mat_coo.jl")
     include("utils/mat_csr.jl")
