@@ -176,7 +176,7 @@ end
     native_mul!(c, A::GPUSparseMatrixCSR, b, α, β)
 
 Run the ordinary `mul!` of `A`, unless Reactant is raising kernels to StableHLO: `mul!`'s CSR
-kernels do not survive raising, so [`CoolPDLP.spmv_csr_blocks!`](@ref) computes the product
+kernels do not survive raising, so [`CoolPDLP.spmv_csr_raisable!`](@ref) computes the product
 instead. Its kernels launch on the traced arrays themselves, as it is not overlaid.
 """
 function native_mul!(
@@ -186,7 +186,7 @@ function native_mul!(
         c::AbstractVector, A::Any, b::AbstractVector, α::Number, β::Number
     )
     scale!!(c, β)
-    CoolPDLP.spmv_csr_blocks!(c, A, b, α, true)
+    CoolPDLP.spmv_csr_raisable!(c, A, b, α, true)
     return c
 end
 

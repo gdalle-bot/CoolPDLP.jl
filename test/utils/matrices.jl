@@ -182,10 +182,14 @@ end
         m, n = size(A)
         A_jl = adapt(JLBackend(), GPUSparseMatrixCSR(A))
         b, c = rand(n), rand(m)
-        @test CoolPDLP.spmv_csr_blocks!(jl(copy(c)), A_jl, jl(b), α, β) ≈ α * (A * b) + β * c
-        @test CoolPDLP.spmv_csr_blocks!(jl(copy(c)), A_jl, jl(b), 1.0, β) ≈ A * b + β * c
-        @test CoolPDLP.spmv_csr_blocks!(jl(fill(NaN, m)), A_jl, jl(b), α, 0.0) ≈ α * (A * b)
-        @test CoolPDLP.spmv_csr_blocks!(jl(fill(NaN, m)), A_jl, jl(b), 1.0, 0.0) ≈ A * b
+        @testset "$f" for f in (
+                CoolPDLP.spmv_csr_blocks!, CoolPDLP.spmv_csr_short!, CoolPDLP.spmv_csr_raisable!,
+            )
+            @test f(jl(copy(c)), A_jl, jl(b), α, β) ≈ α * (A * b) + β * c
+            @test f(jl(copy(c)), A_jl, jl(b), 1.0, β) ≈ A * b + β * c
+            @test f(jl(fill(NaN, m)), A_jl, jl(b), α, 0.0) ≈ α * (A * b)
+            @test f(jl(fill(NaN, m)), A_jl, jl(b), 1.0, 0.0) ≈ A * b
+        end
         return nothing
     end
 
@@ -222,4 +226,21 @@ end
         c = CoolPDLP.spmv_csr_blocks!(jl(zeros(2)), A_jl, jl(ones(2nz)), 1.0, 0.0)
         @test Array(c) == [nz * 1.0e16, nz]
     end
+end
+
+@testset "Longest CSR row" begin
+    A = banded_csr(401, 260, 6)
+    A[7, :] = 1:260
+    A[9, :] .= 0
+    A = sparse(A)
+    longest = maximum(i -> nnz(A[i, :]), axes(A, 1))
+    A_csr = GPUSparseMatrixCSR(A)
+    @test A_csr.maxrow == longest == 260
+    A_jl = adapt(JLBackend(), A_csr)
+    @test A_jl.maxrow == longest
+    # rebuilt from its arrays alone, here on the device
+    @test GPUSparseMatrixCSR(A_jl.m, A_jl.n, A_jl.rowptr, A_jl.colval, A_jl.nzval).maxrow == longest
+    @test CoolPDLP.sametype_transpose(A_jl).maxrow == maximum(j -> nnz(A[:, j]), axes(A, 2))
+    @test GPUSparseMatrixCSR(spzeros(0, 3)).maxrow == 0
+    @test GPUSparseMatrixCSR(spzeros(4, 3)).maxrow == 0
 end

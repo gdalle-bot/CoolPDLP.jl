@@ -16,6 +16,29 @@ struct GPUSparseMatrixCSR{
     rowptr::Vi
     colval::Vi
     nzval::V
+    "number of nonzeros in the longest row"
+    maxrow::Int
+end
+
+"""
+    GPUSparseMatrixCSR(m, n, rowptr, colval, nzval)
+
+Build the matrix from its CSR arrays, reading the length of its longest row from `rowptr`.
+"""
+function GPUSparseMatrixCSR(
+        m::Integer, n::Integer, rowptr::AbstractVector, colval::AbstractVector, nzval::AbstractVector
+    )
+    return GPUSparseMatrixCSR(m, n, rowptr, colval, nzval, longest_row(rowptr))
+end
+
+"""
+    longest_row(rowptr)
+
+Number of nonzeros in the longest row of a CSR matrix with row pointers `rowptr`.
+"""
+function longest_row(rowptr::AbstractVector)
+    length(rowptr) <= 1 && return 0
+    return Int(maximum(view(rowptr, 2:length(rowptr)) .- view(rowptr, 1:(length(rowptr) - 1))))
 end
 
 Base.size(A::GPUSparseMatrixCSR) = (A.m, A.n)
@@ -51,7 +74,8 @@ function Adapt.adapt_structure(to, A::GPUSparseMatrixCSR)
         A.n,
         adapt(to, A.rowptr),
         adapt(to, A.colval),
-        adapt(to, A.nzval)
+        adapt(to, A.nzval),
+        A.maxrow
     )
 end
 
@@ -464,15 +488,14 @@ each level of its pyramid is shorter than the level below.
 const BLOCK_FANOUT = 8
 
 """
-    block_levels(nz, C)
+    block_levels(len, C)
 
-Number of levels in a pyramid of block sums over `nz` entries with fan-out `C`, counting its
-base: enough for [`peel_blocks`](@ref) to have consumed any range of these entries by the time
-it leaves the top level.
+Number of levels in a pyramid of block sums with fan-out `C`, counting its base, that
+[`peel_blocks`](@ref) needs to consume any range of at most `len` entries.
 """
-function block_levels(nz::Integer, C::Integer)
+function block_levels(len::Integer, C::Integer)
     L, width = 1, C
-    while width <= nz
+    while width <= len
         L += 1
         width *= C
     end
@@ -625,11 +648,12 @@ only holds products of that row, so nothing is ever subtracted and the other row
 affect the result.
 
 A row reads at most `2 * (BLOCK_FANOUT - 1)` entries per level, whatever its length, and the
-number of levels grows with the logarithm of `nnz(A)`. The base is never stored: a row
-recomputes the few products it reads (see [`CSRProducts`](@ref)), so the pyramid costs
-little more than one pass over the nonzeros.
+number of levels grows with the logarithm of the longest row, `A.maxrow`. The base is never
+stored: a row recomputes the few products it reads (see [`CSRProducts`](@ref)), so the
+pyramid costs little more than one pass over the nonzeros.
 
-Every row goes through every level, so this is slowest on matrices with many short rows.
+Every row goes through every level, which [`spmv_csr_short!`](@ref) avoids when all rows are
+short.
 """
 function spmv_csr_blocks!(
         c::AbstractVector, A::GPUSparseMatrixCSR, b::AbstractVector, α::Number, β::Number
@@ -640,7 +664,7 @@ function spmv_csr_blocks!(
     C = BLOCK_FANOUT
     m == 0 && return c
     levels = typeof(A.nzval)[]
-    for _ in 2:block_levels(nz, C)
+    for _ in 2:block_levels(A.maxrow, C)
         if isempty(levels)
             P = similar(A.nzval, cld(nz, C))
             csr_block_products!(backend)(P, A.colval, A.nzval, b, Val(C); ndrange = length(P))
@@ -663,4 +687,86 @@ function spmv_csr_blocks!(
         kernel!(args..., α, β, Val(C); ndrange = m)
     end
     return c
+end
+
+"""
+    SHORT_ROWS
+
+Longest row for which [`spmv_csr_raisable!`](@ref) sums each row directly rather than over a
+pyramid of blocks.
+"""
+const SHORT_ROWS = 16
+
+"""
+    csr_short_rows!(c, A_rowptr, A_colval, A_nzval, b, α, β, Val(W))
+
+Set `c[i] = α * s + β * c[i]`, where `s` sums the products of row `i`: one work item per row,
+whose loop has exactly `W` steps, `W` being at least the length of the longest row.
+"""
+@kernel function csr_short_rows!(
+        c::DenseVector{T},
+        A_rowptr::DenseVector{Ti},
+        A_colval::DenseVector{Ti},
+        A_nzval::DenseVector{T},
+        b::DenseVector{T},
+        α::Number,
+        β::Number,
+        ::Val{W}
+    ) where {T, Ti, W}
+    i = @index(Global, Linear)
+    @inbounds lo, hi = Int(A_rowptr[i]), Int(A_rowptr[i + Ti(1)]) - 1
+    s = zero(T)
+    for t in 0:(W - 1)
+        k = lo + t
+        @inbounds v = k <= hi ? A_nzval[k] * b[A_colval[k]] : zero(T)
+        s += v
+    end
+    @inbounds c[i] = α * s + β * c[i]
+end
+
+"""
+    spmv_csr_short!(c, A::GPUSparseMatrixCSR, b, α, β)
+
+Compute `c = α * A * b + β * c`, like `mul!`, with one work item per row looping over exactly
+`A.maxrow` nonzeros. That trip count is fixed at launch, so Reactant can raise the kernel to
+StableHLO, where every row then costs as much as the longest one: this is only worth it when
+all rows are short.
+"""
+function spmv_csr_short!(
+        c::AbstractVector, A::GPUSparseMatrixCSR, b::AbstractVector, α::Number, β::Number
+    )
+    check_mul_dims(c, A, b)
+    backend = common_backend(c, A, b)
+    m = size(A, 1)
+    m == 0 && return c
+    kernel! = csr_short_rows!(backend)
+    args = (c, A.rowptr, A.colval, A.nzval, b)
+    W = Val(A.maxrow)
+    if isone(α) && iszero(β)
+        kernel!(args..., One(), Zero(), W; ndrange = m)
+    elseif isone(α)
+        kernel!(args..., One(), β, W; ndrange = m)
+    elseif iszero(β)
+        kernel!(args..., α, Zero(), W; ndrange = m)
+    else
+        kernel!(args..., α, β, W; ndrange = m)
+    end
+    return c
+end
+
+"""
+    spmv_csr_raisable!(c, A::GPUSparseMatrixCSR, b, α, β)
+
+Compute `c = α * A * b + β * c`, like `mul!`, with kernels that Reactant can raise to
+StableHLO: [`spmv_csr_short!`](@ref) when no row has more than [`SHORT_ROWS`](@ref) nonzeros,
+[`spmv_csr_blocks!`](@ref) otherwise.
+"""
+function spmv_csr_raisable!(
+        c::AbstractVector, A::GPUSparseMatrixCSR, b::AbstractVector, α::Number, β::Number
+    )
+    if A.maxrow <= SHORT_ROWS
+        return spmv_csr_short!(c, A, b, α, β)
+    else
+        return spmv_csr_blocks!(c, A, b, α, β)
+    end
 end
