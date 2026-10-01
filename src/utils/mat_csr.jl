@@ -452,3 +452,214 @@ function LinearAlgebra.mul!(
     end
     return c
 end
+
+## A CSR product that Reactant can raise to StableHLO
+
+"""
+    BLOCK_FANOUT
+
+Number of entries that each block of [`spmv_csr_blocks!`](@ref) sums, i.e. the factor by which
+each level of its pyramid is shorter than the level below.
+"""
+const BLOCK_FANOUT = 8
+
+"""
+    block_levels(nz, C)
+
+Number of levels in a pyramid of block sums over `nz` entries with fan-out `C`, counting its
+base: enough for [`peel_blocks`](@ref) to have consumed any range of these entries by the time
+it leaves the top level.
+"""
+function block_levels(nz::Integer, C::Integer)
+    L, width = 1, C
+    while width <= nz
+        L += 1
+        width *= C
+    end
+    return L
+end
+
+"""
+    CSRProducts(A_colval, A_nzval, b)
+
+The products `A_nzval[k] * b[A_colval[k]]`, which index like a vector but are never stored:
+they are the base of the pyramid of [`spmv_csr_blocks!`](@ref), of which a row reads at most
+`2 * (BLOCK_FANOUT - 1)` entries.
+"""
+struct CSRProducts{Vi, V, Vb}
+    A_colval::Vi
+    A_nzval::V
+    b::Vb
+end
+
+Base.@propagate_inbounds function Base.getindex(p::CSRProducts, k::Integer)
+    return p.A_nzval[k] * p.b[p.A_colval[k]]
+end
+
+"""
+    csr_block_products!(P, A_colval, A_nzval, b, Val(C))
+
+Sum the products `A_nzval[k] * b[A_colval[k]]` over consecutive blocks of `C` nonzeros into `P`,
+with one work item per block.
+"""
+@kernel function csr_block_products!(
+        P::DenseVector{T},
+        A_colval::DenseVector{Ti},
+        A_nzval::DenseVector{T},
+        b::DenseVector{T},
+        ::Val{C}
+    ) where {T, Ti, C}
+    q = @index(Global, Linear)
+    nz = length(A_nzval)
+    s = zero(T)
+    for u in 1:C
+        k = (q - 1) * C + u
+        if k <= nz
+            @inbounds s += A_nzval[k] * b[A_colval[k]]
+        end
+    end
+    @inbounds P[q] = s
+end
+
+"""
+    block_sums!(Q, P, Val(C))
+
+Sum `P` over consecutive blocks of `C` entries into `Q`, with one work item per block.
+"""
+@kernel function block_sums!(Q::DenseVector{T}, P::DenseVector{T}, ::Val{C}) where {T, C}
+    q = @index(Global, Linear)
+    n = length(P)
+    s = zero(T)
+    for u in 1:C
+        x = (q - 1) * C + u
+        @inbounds v = x <= n ? P[x] : zero(T)
+        s += v
+    end
+    @inbounds Q[q] = s
+end
+
+"""
+    peel_blocks(P, lo, hi, s, Val(C))
+
+Add to `s` the entries of `P` in `lo:hi` that do not fill a whole block of `C`: at most `C - 1`
+from `lo` up to the first block boundary, and as many from `hi` down to the last one. Return
+the whole blocks that remain, as a range of indices one level up the pyramid, and the new sum.
+
+Every remainder here is of a non-negative value, because Reactant lowers `mod` to a truncated
+remainder when it raises a kernel to StableHLO, which is wrong for negative operands.
+"""
+@inline function peel_blocks(P, lo::Int, hi::Int, s, ::Val{C}) where {C}
+    r = (lo - 1) % C
+    nleft = max(min(hi - lo + 1, ifelse(r == 0, 0, C - r)), 0)
+    for u in 0:(C - 2)
+        @inbounds v = u < nleft ? P[lo + u] : zero(s)
+        s += v
+    end
+    lo += nleft
+    nright = max(min(hi - lo + 1, hi % C), 0)
+    for u in 0:(C - 2)
+        @inbounds v = u < nright ? P[hi - u] : zero(s)
+        s += v
+    end
+    hi -= nright
+    return (lo - 1) ÷ C + 1, hi ÷ C, s
+end
+
+"""
+    sum_blocks(levels, lo, hi, s, Val(C))
+
+Add to `s` the sum of `first(levels)[lo:hi]`, read from the coarsest blocks of the pyramid
+`levels` that fit in this range.
+"""
+@inline sum_blocks(::Tuple{}, lo::Int, hi::Int, s, ::Val{C}) where {C} = s
+@inline function sum_blocks(levels::Tuple, lo::Int, hi::Int, s, ::Val{C}) where {C}
+    lo, hi, s = peel_blocks(first(levels), lo, hi, s, Val(C))
+    return sum_blocks(Base.tail(levels), lo, hi, s, Val(C))
+end
+
+"""
+    csr_block_rows!(c, A_rowptr, A_colval, A_nzval, b, levels, α, β, Val(C))
+
+Set `c[i] = α * s + β * c[i]`, where `s` sums the products of row `i` over the pyramid whose
+base is [`CSRProducts`](@ref) and whose upper levels are `levels`: one work item per row.
+"""
+@kernel function csr_block_rows!(
+        c::DenseVector{T},
+        A_rowptr::DenseVector{Ti},
+        A_colval::DenseVector{Ti},
+        A_nzval::DenseVector{T},
+        b::DenseVector{T},
+        levels::Tuple,
+        α::Number,
+        β::Number,
+        ::Val{C}
+    ) where {T, Ti, C}
+    i = @index(Global, Linear)
+    @inbounds lo, hi = Int(A_rowptr[i]), Int(A_rowptr[i + Ti(1)]) - 1
+    base = CSRProducts(A_colval, A_nzval, b)
+    s = sum_blocks((base, levels...), lo, hi, zero(T), Val(C))
+    @inbounds c[i] = α * s + β * c[i]
+end
+
+"""
+    spmv_csr_blocks!(c, A::GPUSparseMatrixCSR, b, α, β)
+
+Compute `c = α * A * b + β * c`, like `mul!`, with kernels whose every loop has a trip count
+fixed at launch. This is what lets Reactant raise them to StableHLO (`@compile raise = true`),
+which XLA then optimizes along with the rest of the program, and which backends that cannot
+run a custom kernel require.
+
+The loops of `mul!`'s kernels run over the nonzeros of a row, so their trip counts are read
+from `A.rowptr`. Reactant either refuses to raise them (the local memory of
+[`spmv_csr_vector!`](@ref)), or raises them into a loop over the longest row for every row at
+once, which makes a product with a long row orders of magnitude slower.
+
+The products are summed over a pyramid of blocks instead. Its base holds the products
+`A.nzval[k] * b[A.colval[k]]` in storage order, and each level above it sums consecutive
+blocks of [`BLOCK_FANOUT`](@ref) entries of the level below, across row boundaries. A row is
+a range of the base, and its sum is read from the coarsest blocks that fit inside that range:
+[`peel_blocks`](@ref) takes the entries at both ends that do not fill a whole block, and moves
+the rest of the range up one level, until nothing is left. A block that fits inside the range
+only holds products of that row, so nothing is ever subtracted and the other rows cannot
+affect the result.
+
+A row reads at most `2 * (BLOCK_FANOUT - 1)` entries per level, whatever its length, and the
+number of levels grows with the logarithm of `nnz(A)`. The base is never stored: a row
+recomputes the few products it reads (see [`CSRProducts`](@ref)), so the pyramid costs
+little more than one pass over the nonzeros.
+
+Every row goes through every level, so this is slowest on matrices with many short rows.
+"""
+function spmv_csr_blocks!(
+        c::AbstractVector, A::GPUSparseMatrixCSR, b::AbstractVector, α::Number, β::Number
+    )
+    check_mul_dims(c, A, b)
+    backend = common_backend(c, A, b)
+    m, nz = size(A, 1), nnz(A)
+    C = BLOCK_FANOUT
+    m == 0 && return c
+    levels = typeof(A.nzval)[]
+    for _ in 2:block_levels(nz, C)
+        if isempty(levels)
+            P = similar(A.nzval, cld(nz, C))
+            csr_block_products!(backend)(P, A.colval, A.nzval, b, Val(C); ndrange = length(P))
+        else
+            Q = last(levels)
+            P = similar(Q, cld(length(Q), C))
+            block_sums!(backend)(P, Q, Val(C); ndrange = length(P))
+        end
+        push!(levels, P)
+    end
+    kernel! = csr_block_rows!(backend)
+    args = (c, A.rowptr, A.colval, A.nzval, b, Tuple(levels))
+    if isone(α) && iszero(β)
+        kernel!(args..., One(), Zero(), Val(C); ndrange = m)
+    elseif isone(α)
+        kernel!(args..., One(), β, Val(C); ndrange = m)
+    elseif iszero(β)
+        kernel!(args..., α, Zero(), Val(C); ndrange = m)
+    else
+        kernel!(args..., α, β, Val(C); ndrange = m)
+    end
+    return c
+end

@@ -172,3 +172,54 @@ end
         @test mul!(jl(fill(NaN, size(A, 1), nbatch)), A_jl, jl(B), 1.0, 0.0) ≈ A * B
     end
 end
+
+@testset "CSR product through block sums" begin
+    # `spmv_csr_blocks!` is what a Reactant-raised `mul!` runs. A row is summed from the
+    # blocks of a pyramid that fit in its range, so what matters is where rows start and end
+    # relative to block boundaries at every level, and how many levels a row climbs.
+    F = CoolPDLP.BLOCK_FANOUT
+    function test_blocks(A)
+        m, n = size(A)
+        A_jl = adapt(JLBackend(), GPUSparseMatrixCSR(A))
+        b, c = rand(n), rand(m)
+        @test CoolPDLP.spmv_csr_blocks!(jl(copy(c)), A_jl, jl(b), α, β) ≈ α * (A * b) + β * c
+        @test CoolPDLP.spmv_csr_blocks!(jl(copy(c)), A_jl, jl(b), 1.0, β) ≈ A * b + β * c
+        @test CoolPDLP.spmv_csr_blocks!(jl(fill(NaN, m)), A_jl, jl(b), α, 0.0) ≈ α * (A * b)
+        @test CoolPDLP.spmv_csr_blocks!(jl(fill(NaN, m)), A_jl, jl(b), 1.0, 0.0) ≈ A * b
+        return nothing
+    end
+
+    @testset "random matrices" begin
+        foreach(test_blocks, A_candidates)
+    end
+    @testset "$nz_per_row nonzeros per row" for nz_per_row in (1, 3, F - 1, F, F + 1, 2F + 3)
+        test_blocks(banded_csr(501, 40, nz_per_row))
+    end
+    # one row holding every nonzero climbs to the top level, and the levels' last blocks are
+    # only partly filled unless the number of nonzeros is a power of the fan-out
+    @testset "a single row of $nz nonzeros" for nz in (1, F - 1, F, F + 1, F^2 - 1, F^2, F^2 + 1, F^3 + 5)
+        test_blocks(sparse(ones(1, nz)))
+    end
+    @testset "skewed rows" begin
+        A = banded_csr(401, 260, 6)
+        A[3, :] .= 0
+        A[4, :] .= 0
+        A[7, :] = 1:260
+        A[401, :] = 1:260
+        test_blocks(sparse(A))
+    end
+    @testset "no nonzeros" begin
+        test_blocks(spzeros(37, 21))
+        test_blocks(spzeros(0, 21))
+    end
+
+    @testset "no cancellation between rows" begin
+        # a block that straddles two rows is never read, so the huge entries of the first
+        # row cannot swallow the small ones of the second, whatever the fan-out
+        nz = F^2 + 1
+        A = sparse([fill(1, nz); fill(2, nz)], 1:(2nz), [fill(1.0e16, nz); fill(1.0, nz)])
+        A_jl = adapt(JLBackend(), GPUSparseMatrixCSR(A))
+        c = CoolPDLP.spmv_csr_blocks!(jl(zeros(2)), A_jl, jl(ones(2nz)), 1.0, 0.0)
+        @test Array(c) == [nz * 1.0e16, nz]
+    end
+end

@@ -36,6 +36,22 @@ const MATRIX_TYPES = (GPUSparseMatrixCSR, GPUSparseMatrixELL, GPUSparseMatrixCOO
             @test_throws "Reactant.jl/issues/3269" @compile mul!(c_r, A_r, b_r, α, β)
         end
     end
+
+    # COO's atomic update does not raise yet, and CSR only does through `spmv_csr_blocks!`
+    @testset "$M raised to StableHLO" for M in (GPUSparseMatrixCSR, GPUSparseMatrixELL)
+        # a long row next to empty ones, so that a row climbs the pyramid of block sums
+        A_skew = copy(A_cpu)
+        A_skew[3, :] = randn(rng, 16)
+        A_skew[5, :] .= 0
+        A_r = to_rarray(M(dropzeros(A_skew)); track_numbers = true)
+        b, c0 = randn(rng, 16), randn(rng, 24)
+        b_r, c_r = to_rarray(b), to_rarray(copy(c0))
+        compiled = @compile raise = true mul!(c_r, A_r, b_r, α, β)
+        compiled(c_r, A_r, b_r, α, β)
+        @test Array(c_r) ≈ α * (A_skew * b) + β * c0
+        # no kernel call is left once every kernel is raised
+        @test !occursin("kernel_call", string(@code_hlo raise = true mul!(c_r, A_r, b_r, α, β)))
+    end
 end
 
 @testset verbose = true "Compiled solve" begin
@@ -87,6 +103,16 @@ end
             @test termination_status(state_r.stats) == termination_status(state.stats)
             @test Array(state_r.sol.x) ≈ Array(state.sol.x) rtol = 1.0e-6
             @test Array(state_r.sol.y) ≈ Array(state.sol.y) rtol = 1.0e-6
+
+            if M != GPUSparseMatrixCOO  # its atomic update does not raise yet
+                state_r, milp_r, algo_r = traced_problem(milp0, sol0, algo)
+                raised_solve! = @compile raise = true CoolPDLP.solve!(state_r, milp_r, algo_r)
+                raised_solve!(state_r, milp_r, algo_r)
+                @test Int(state_r.stats.kkt_passes) == state.stats.kkt_passes
+                @test termination_status(state_r.stats) == termination_status(state.stats)
+                @test Array(state_r.sol.x) ≈ Array(state.sol.x) rtol = 1.0e-6
+                @test Array(state_r.sol.y) ≈ Array(state.sol.y) rtol = 1.0e-6
+            end
         end
 
         @testset "batched" begin

@@ -173,6 +173,24 @@ function native_mul!(c::AbstractVector, A, b::AbstractVector, α::Number, β::Nu
 end
 
 """
+    native_mul!(c, A::GPUSparseMatrixCSR, b, α, β)
+
+Run the ordinary `mul!` of `A`, unless Reactant is raising kernels to StableHLO: `mul!`'s CSR
+kernels do not survive raising, so [`CoolPDLP.spmv_csr_blocks!`](@ref) computes the product
+instead. Its kernels launch on the traced arrays themselves, as it is not overlaid.
+"""
+function native_mul!(
+        c::AbstractVector, A::CoolPDLP.GPUSparseMatrixCSR, b::AbstractVector, α::Number, β::Number
+    )
+    Reactant.Compiler.raising() || return @invoke native_mul!(
+        c::AbstractVector, A::Any, b::AbstractVector, α::Number, β::Number
+    )
+    scale!!(c, β)
+    CoolPDLP.spmv_csr_blocks!(c, A, b, α, true)
+    return c
+end
+
+"""
     write_time!(out)
 
 Write the current host time into the single-element output buffer of a Reactant callback.
