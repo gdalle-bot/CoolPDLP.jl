@@ -102,3 +102,14 @@ function termination_status!!(
         return MOI.OPTIMIZE_NOT_CALLED
     end
 end
+
+function should_terminate!!(
+        dest::BatchedNumber, stats::ConvergenceStats, params::TerminationParameters
+    )
+    (; err, time_elapsed, kkt_passes) = stats
+    (; termination_reltol, time_limit, max_kkt_passes) = params
+    is_optimal = batched_all(<=(termination_reltol), relative!!(dest, err))
+    is_time_limit = time_elapsed >= time_limit
+    is_iteration_limit = kkt_passes >= max_kkt_passes
+    return is_optimal || is_time_limit || is_iteration_limit
+end
